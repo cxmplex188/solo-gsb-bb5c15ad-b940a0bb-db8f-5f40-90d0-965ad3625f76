@@ -42,13 +42,24 @@ docker build -t metrological-traceability-api .
 docker run -p 8000:8000 -e SEED_DEMO=1 -v trace-data:/data metrological-traceability-api
 ```
 
+容器启动后可用健康检查与批量提交预检（dry-run，不写库）快速验证部署：
+
+```bash
+curl -fsS http://localhost:8000/health                 # {"status":"ok"}
+curl -s -X POST http://localhost:8000/api/submissions/preflight \
+  -H 'Content-Type: application/json' \
+  -d '{"instruments":[],"certificates":[],"edges":[]}'
+# {"strict_digest":false,"dry_run":true,"ok":true,...,
+#  "would_upsert":{"instruments":0,"certificates":0,"edges":0,"total":0}}
+```
+
 ## 二、本地开发运行（无 Docker）
 
 ```bash
 pip install -r requirements.txt
 SEED_DEMO=1 TRACE_DB_PATH=./data/traceability.db \
   uvicorn app.main:app --reload --port 8000
-pytest -q        # 运行测试（18 个用例）
+pytest -q        # 运行测试（29 个用例）
 ```
 
 > 所有时间均按 **UTC** 解释，建议使用 `YYYY-MM-DDTHH:MM:SSZ` 格式。
@@ -85,6 +96,7 @@ trace_edges（父子溯源边）
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | POST | `/api/submissions` | 批量提交（upsert）：仪器 + 证书 + 溯源边 |
+| POST | `/api/submissions/preflight` | **批量提交预检（dry-run，独立事务回滚，绝不写库）** |
 | POST | `/api/instruments` | 单个仪器 upsert |
 | GET | `/api/instruments` · `/api/instruments/{code}` | 仪器列表/详情 |
 | POST | `/api/certificates` | 单个证书 upsert（未给摘要时服务端重算） |
@@ -130,6 +142,102 @@ curl -X POST http://localhost:8000/api/submissions \
 
 `signature_digest` 与 `signed_payload` 均可留空：服务端按固定字段集生成
 规范化 JSON（键排序、无空白、UTF-8）并计算 SHA-256 摘要，日后逐字节可复核。
+
+### 1.1）批量提交预检（POST /api/submissions/preflight）
+
+正式提交前先做整批校验：请求体与 `/api/submissions` **完全相同**，另加
+`strict_digest` 开关。服务在**独立事务**（独立连接，进入即 `BEGIN`、退出一律
+`ROLLBACK`）中按提交顺序（仪器 → 证书 → 边）高保真模拟整批 upsert，依次执行：
+
+1. **引用校验** — 证书的 `instrument_code`、边的 `child_cert_id`/`parent_cert_id`
+   必须已存在于库中或同批先提交（同批引用可正常解析）；
+2. **区间校验** — 证书 `valid_from ≤ valid_until`；溯源边自身区间不倒置，
+   且必须与子证书有效区间相交（边区间缺省继承子证书区间）；
+3. **自环校验** — 溯源边 `child_cert_id` 不得等于 `parent_cert_id`；
+4. **摘要校验** — 仅当**显式**提交 `signature_digest` 时才与服务端按规范化
+   载荷的重算值比对（留空则由服务端重算，不产生问题）：
+   `strict_digest=true` 记为**错误**（`errors`，`ok=false`），
+   `strict_digest=false`（默认）记为**警告**（`warnings`，不阻断）。
+
+响应恒为 **200**（载荷本身的 JSON/字段格式错误仍返回 422），包含稳定排序的
+错误/警告列表：`path` 为 JSON Pointer 风格字段路径（如
+`certificates/0/instrument_code`、`edges/2/parent_cert_id`，排序时下标按
+整数比较，故 `.../2` 排在 `.../10` 之前），并带机器可读 `code`、中文 `message`
+与结构化 `detail`；`would_upsert` 给出若正式提交将执行 upsert 的条目数量
+（存在阻断性错误的条目不写入、也不计数；摘要不匹配从不阻断）。
+响应恒带 `"dry_run": true`——**预检绝不写入数据库**，可安全重复调用。
+
+```bash
+curl -X POST http://localhost:8000/api/submissions/preflight \
+  -H 'Content-Type: application/json' -d '{
+  "strict_digest": true,
+  "instruments": [
+    {"code": "G", "name": "国家长度基准", "is_national_standard": true},
+    {"code": "W", "name": "数显卡尺"}
+  ],
+  "certificates": [
+    {"id": "CG", "instrument_code": "G", "cert_number": "NIM-001",
+     "issued_at": "2024-01-02T00:00:00Z",
+     "valid_from": "2024-01-01T00:00:00Z", "valid_until": "2029-01-01T00:00:00Z",
+     "uncertainty": 0.000001, "unit": "mm"},
+    {"id": "CW", "instrument_code": "W", "cert_number": "CAL-101",
+     "issued_at": "2026-01-10T00:00:00Z",
+     "valid_from": "2026-01-01T00:00:00Z", "valid_until": "2027-01-01T00:00:00Z",
+     "uncertainty": 0.002, "unit": "mm",
+     "signature_digest": "0000000000000000000000000000000000000000000000000000000000000000"}
+  ],
+  "edges": [
+    {"child_cert_id": "CW", "parent_cert_id": "CW"}
+  ]
+}'
+```
+
+```jsonc
+{
+  "strict_digest": true,
+  "dry_run": true,                    // 恒为 true：预检不写库
+  "ok": false,                        // errors 非空即为 false（警告不影响）
+  "error_count": 2,
+  "warning_count": 0,
+  "errors": [
+    {
+      "path": "certificates/1/signature_digest",
+      "code": "SIGNATURE_DIGEST_MISMATCH",
+      "message": "证书 CW（CAL-101）签名摘要校验失败：提交 0000…，重算 9f86…",
+      "detail": {
+        "certificate_id": "CW", "digest_alg": "sha256",
+        "submitted": "0000…", "recomputed": "9f86…"
+      }
+    },
+    {
+      "path": "edges/0/parent_cert_id",
+      "code": "EDGE_SELF_LOOP",
+      "message": "溯源边不能指向证书自身（自环）",
+      "detail": {"child_cert_id": "CW", "parent_cert_id": "CW"}
+    }
+  ],
+  "warnings": [],                     // strict_digest=false 时摘要不匹配出现在这里
+  "would_upsert": {
+    "instruments": 2, "certificates": 2, "edges": 0, "total": 4
+  }
+}
+```
+
+预检错误码：
+
+| code | path 指向 | 含义 |
+| --- | --- | --- |
+| `INSTRUMENT_NOT_FOUND` | `certificates/{i}/instrument_code` | 证书引用的仪器在库中/同批均不存在 |
+| `CERTIFICATE_INTERVAL_INVALID` | `certificates/{i}/valid_from` | 证书 `valid_from` 晚于 `valid_until` |
+| `SIGNATURE_DIGEST_MISMATCH` | `certificates/{i}/signature_digest` | 显式摘要与重算值不符（strict 时 ERROR，否则 WARN） |
+| `CHILD_CERT_NOT_FOUND` | `edges/{i}/child_cert_id` | 子证书不存在 |
+| `PARENT_CERT_NOT_FOUND` | `edges/{i}/parent_cert_id` | 父证书不存在 |
+| `EDGE_SELF_LOOP` | `edges/{i}/parent_cert_id` | 溯源边指向证书自身 |
+| `EDGE_INTERVAL_INVALID` | `edges/{i}/valid_from` | 边自身 `valid_from` 晚于 `valid_until` |
+| `EDGE_INTERVAL_DISJOINT` | `edges/{i}/valid_from` | 边有效区间与子证书区间完全不相交 |
+
+> 预检通过（`ok=true`）后再以相同载荷调用 `POST /api/submissions` 即可正式写入；
+> 预检与正式提交之间若有其他写入，正式提交仍可能因数据变化而返回 422。
 
 ### 2）链路查询 / 3）校验报告 / 4）JSON 导出
 
@@ -328,8 +436,10 @@ app/
   engine.py          溯源链重建（DFS）、校验规则、停用影响模拟（内存 Catalog）
   seed.py            四场景演示数据
   routers/           instruments / certificates / edges /
-                     submissions / trace(report + 停用影响评估) / export / admin
+                     submissions（批量提交 + preflight 预检）/
+                     trace(report + 停用影响评估) / export / admin
 tests/test_trace.py        10 个接口级测试
+tests/test_preflight.py    11 个批量提交预检测试
 tests/test_deactivation.py 8 个停用影响评估测试
 Dockerfile · docker-compose.yml · requirements.txt
 ```

@@ -79,6 +79,18 @@ class SubmissionIn(BaseModel):
     edges: List[TraceEdgeIn] = Field(default_factory=list)
 
 
+class SubmissionPreflightIn(SubmissionIn):
+    """批量提交预检请求：载荷与 /api/submissions 相同，另加摘要校验开关。"""
+
+    strict_digest: bool = Field(
+        False,
+        description=(
+            "true 时显式 signature_digest 与重算值不符按错误（ERROR）计；"
+            "false（默认）时仅按警告（WARN）计，不阻断提交"
+        ),
+    )
+
+
 class DeactivationIn(BaseModel):
     """证书停用影响评估请求（dry-run，不写入数据库）。"""
     at: Optional[datetime] = Field(
@@ -144,6 +156,49 @@ class SubmissionResult(BaseModel):
     instruments_upserted: List[str]
     certificates_upserted: List[str]
     edges_upserted: List[int]
+
+
+class PreflightIssue(BaseModel):
+    """预检发现的单条错误/警告，可精确定位到提交载荷中的字段路径。"""
+
+    path: str = Field(
+        ...,
+        description=(
+            "稳定的字段路径（JSON Pointer 风格），如 "
+            "certificates/0/instrument_code、edges/2/parent_cert_id"
+        ),
+    )
+    code: str = Field(..., description="机器可读错误码")
+    message: str = Field(..., description="中文原因说明")
+    detail: dict = Field(default_factory=dict, description="结构化证据")
+
+
+class PreflightUpsertCount(BaseModel):
+    instruments: int
+    certificates: int
+    edges: int
+    total: int
+
+
+class SubmissionPreflightResult(BaseModel):
+    strict_digest: bool
+    dry_run: bool = Field(
+        ..., description="恒为 true：预检在独立事务中模拟并整体回滚，不写库"
+    )
+    ok: bool = Field(
+        ..., description="errors 为空时为 true（警告不影响 ok）"
+    )
+    error_count: int
+    warning_count: int
+    errors: List[PreflightIssue] = Field(
+        default_factory=list, description="稳定排序后的错误列表"
+    )
+    warnings: List[PreflightIssue] = Field(
+        default_factory=list, description="稳定排序后的警告列表"
+    )
+    would_upsert: PreflightUpsertCount = Field(
+        ..., description="若按当前载荷正式提交，将执行 upsert 的条目数量"
+    )
 
 
 class Conflict(BaseModel):

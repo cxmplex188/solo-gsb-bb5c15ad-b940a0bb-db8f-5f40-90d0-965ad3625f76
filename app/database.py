@@ -93,6 +93,22 @@ def get_db() -> Iterator[sqlite3.Connection]:
         conn.close()
 
 
+@contextmanager
+def get_preflight_conn() -> Iterator[sqlite3.Connection]:
+    """预检专用连接：独立于请求连接，进入即开启事务，退出一律 ROLLBACK。
+
+    预检流程可在其中照常执行 upsert 语句做高保真模拟，但任何写入都随回滚
+    消失，绝不持久化到数据库。
+    """
+    conn = _connect()
+    conn.execute("BEGIN")
+    try:
+        yield conn
+    finally:
+        conn.rollback()
+        conn.close()
+
+
 def init_db() -> None:
     with get_conn_ctx() as conn:
         conn.executescript(SCHEMA)

@@ -61,6 +61,9 @@ def root():
             "validation_report": "/api/reports/{instrument}",
             "json_export": "/api/export/{instrument}",
             "batch_submission": "POST /api/submissions",
+            "batch_submission_preflight": (
+                "POST /api/submissions/preflight（dry-run，不写库）"
+            ),
             "certificate_deactivation_impact": (
                 "POST /api/assessments/certificate-deactivation"
             ),
