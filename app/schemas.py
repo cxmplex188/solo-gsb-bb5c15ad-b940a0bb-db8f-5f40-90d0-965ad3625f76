@@ -79,6 +79,17 @@ class SubmissionIn(BaseModel):
     edges: List[TraceEdgeIn] = Field(default_factory=list)
 
 
+class SubmissionPreflightIn(SubmissionIn):
+    """批量提交预检：载荷与 ``/api/submissions`` 完全一致，另加 strict_digest。"""
+    strict_digest: bool = Field(
+        False,
+        description=(
+            "true：显式提交的签名摘要与重算结果不符时记为 ERROR；"
+            "false（默认）：记为 WARNING。预检永不写库。"
+        ),
+    )
+
+
 class DeactivationIn(BaseModel):
     """证书停用影响评估请求（dry-run，不写入数据库）。"""
     at: Optional[datetime] = Field(
@@ -144,6 +155,44 @@ class SubmissionResult(BaseModel):
     instruments_upserted: List[str]
     certificates_upserted: List[str]
     edges_upserted: List[int]
+
+
+class PreflightIssue(BaseModel):
+    """预检发现的单条问题（错误或警告），路径定位到具体提交项。"""
+    path: str = Field(
+        ...,
+        description=(
+            "稳定的问题定位路径：instruments[i].code / "
+            "certificates[i].id / edges[i].{child_cert_id,parent_cert_id}"
+        ),
+    )
+    code: str = Field(..., description="问题代码，如 EDGE_SELF_LOOP")
+    severity: str = Field(..., description="ERROR | WARN")
+    message: str = Field(..., description="中文说明")
+    detail: dict = Field(default_factory=dict, description="结构化证据")
+
+
+class UpsertCount(BaseModel):
+    inserted: int = Field(..., description="库中不存在、将被新插入的唯一行数")
+    updated: int = Field(..., description="库中已存在、将被更新的唯一行数")
+    total: int = Field(..., description="将被 upsert 的唯一行数（inserted + updated）")
+
+
+class PreflightResult(BaseModel):
+    """批量提交预检结果（dry-run，不写库）。"""
+    dry_run: bool = Field(..., description="恒为 true：预检不写入数据库")
+    strict_digest: bool
+    ok: bool = Field(..., description="无任何 ERROR 级问题时为 true")
+    error_count: int
+    warning_count: int
+    issues: List[PreflightIssue] = Field(
+        default_factory=list,
+        description="稳定排序后的问题列表（按定位路径、代码）",
+    )
+    would_upsert: dict = Field(
+        default_factory=dict,
+        description="若按此载荷提交，各段将 upsert 的唯一行数（含 inserted/updated 拆分）",
+    )
 
 
 class Conflict(BaseModel):

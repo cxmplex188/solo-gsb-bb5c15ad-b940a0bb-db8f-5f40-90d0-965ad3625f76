@@ -42,13 +42,21 @@ docker build -t metrological-traceability-api .
 docker run -p 8000:8000 -e SEED_DEMO=1 -v trace-data:/data metrological-traceability-api
 ```
 
+启动后可先用**只读预检**验证服务与数据（不写库）：
+
+```bash
+curl -X POST http://localhost:8000/api/submissions/preflight \
+  -H 'Content-Type: application/json' -d '{"instruments": [], "certificates": [], "edges": []}'
+# 期望 200：{"dry_run": true, "ok": true, "issues": [], ...}
+```
+
 ## 二、本地开发运行（无 Docker）
 
 ```bash
 pip install -r requirements.txt
 SEED_DEMO=1 TRACE_DB_PATH=./data/traceability.db \
   uvicorn app.main:app --reload --port 8000
-pytest -q        # 运行测试（18 个用例）
+pytest -q        # 运行测试（29 个用例）
 ```
 
 > 所有时间均按 **UTC** 解释，建议使用 `YYYY-MM-DDTHH:MM:SSZ` 格式。
@@ -85,6 +93,7 @@ trace_edges（父子溯源边）
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | POST | `/api/submissions` | 批量提交（upsert）：仪器 + 证书 + 溯源边 |
+| **POST** | **`/api/submissions/preflight`** | **批量提交预检（dry-run，不写库）：引用/区间/自环/摘要** |
 | POST | `/api/instruments` | 单个仪器 upsert |
 | GET | `/api/instruments` · `/api/instruments/{code}` | 仪器列表/详情 |
 | POST | `/api/certificates` | 单个证书 upsert（未给摘要时服务端重算） |
@@ -130,6 +139,78 @@ curl -X POST http://localhost:8000/api/submissions \
 
 `signature_digest` 与 `signed_payload` 均可留空：服务端按固定字段集生成
 规范化 JSON（键排序、无空白、UTF-8）并计算 SHA-256 摘要，日后逐字节可复核。
+
+#### 批量提交预检（dry-run，不写库）
+
+正式提交前可调用 `POST /api/submissions/preflight`：**请求体与
+`/api/submissions` 完全一致**，另加 `strict_digest` 布尔选项（默认 `false`）。
+服务端在**独立只读事务**（`PRAGMA query_only=ON`，连接关闭即回滚）中按提交顺序
+（仪器 → 证书 → 溯源边，同段重复编码后项覆盖前项，与 upsert 语义一致）执行：
+
+- **引用校验** — 证书的 `instrument_code`、溯源边的子/父证书是否存在（含同批次提交项）；
+- **区间校验** — 证书/边自身 `valid_from <= valid_until`，边区间需与子证书区间相交；
+- **自环校验** — 溯源边不得 `child_cert_id == parent_cert_id`；
+- **摘要校验** — 仅对**显式提交**的 `signature_digest` 按规范化载荷重算比对
+  （留空由服务端重算，不算不匹配）；`strict_digest=true` 时不匹配记为
+  **ERROR**，否则记为 **WARNING**。
+
+响应恒为 **200**（字段级格式错误仍由 Pydantic 返回 422），包含稳定排序
+（段 → 提交下标 → 错误码）的问题列表与将 upsert 的数量：
+
+```jsonc
+{
+  "dry_run": true,                       // 恒为 true：预检绝不写库
+  "strict_digest": false,
+  "ok": false,                           // 无 ERROR 时为 true（WARN 不影响）
+  "error_count": 3,
+  "warning_count": 1,
+  "issues": [
+    {
+      "path": "certificates[1].id=CX",   // 稳定定位路径
+      "code": "CERTIFICATE_INVALID_INTERVAL",
+      "severity": "ERROR",
+      "message": "证书 CX 的 valid_from 必须不晚于 valid_until",
+      "detail": {"valid_from": "...", "valid_until": "..."}
+    },
+    {"path": "edges[0].{child_cert_id=CW, parent_cert_id=CW}",
+     "code": "EDGE_SELF_LOOP", "severity": "ERROR", "message": "...", "detail": {}}
+    /* ... */
+  ],
+  "would_upsert": {                      // 若正式提交将影响的唯一行数
+    "instruments":  {"inserted": 3, "updated": 0, "total": 3},
+    "certificates": {"inserted": 2, "updated": 1, "total": 3},
+    "edges":        {"inserted": 2, "updated": 0, "total": 2},
+    "total":        {"inserted": 7, "updated": 1, "total": 8}
+  }
+}
+```
+
+预检错误码：
+
+| code | 级别 | 含义 |
+| --- | --- | --- |
+| `CERT_INSTRUMENT_NOT_FOUND` | ERROR | 证书引用的仪器不存在（库中与本批次均无） |
+| `CERTIFICATE_INVALID_INTERVAL` | ERROR | 证书 `valid_from` 晚于 `valid_until` |
+| `EDGE_CHILD_CERT_NOT_FOUND` / `EDGE_PARENT_CERT_NOT_FOUND` | ERROR | 溯源边子/父证书不存在 |
+| `EDGE_SELF_LOOP` | ERROR | 溯源边指向证书自身 |
+| `EDGE_INVALID_INTERVAL` | ERROR | 溯源边自身区间倒置 |
+| `EDGE_INTERVAL_DISJOINT` | ERROR | 溯源边区间与子证书区间完全不相交 |
+| `SIGNATURE_DIGEST_MISMATCH` | ERROR / **WARN** | 显式摘要与重算不符（受 `strict_digest` 控制） |
+
+```bash
+# 与批量提交相同的载荷，仅改路径；strict_digest 置 true 时摘要不符直接判失败
+curl -X POST http://localhost:8000/api/submissions/preflight \
+  -H 'Content-Type: application/json' -d '{
+  "strict_digest": true,
+  "instruments": [ /* 同 /api/submissions */ ],
+  "certificates": [ /* 同 /api/submissions */ ],
+  "edges": [ /* 同 /api/submissions */ ]
+}'
+```
+
+> 预检只做写入期校验（引用/区间/自环/摘要），不检查链路语义
+> （不确定度收缩、历史区间连续性、多候选成链等）；后者请在正式提交后用
+> `/api/reports/{instrument}` 查询。
 
 ### 2）链路查询 / 3）校验报告 / 4）JSON 导出
 
@@ -322,14 +403,17 @@ curl -X POST http://localhost:8000/api/assessments/certificate-deactivation \
 ```
 app/
   main.py            FastAPI 入口、路由注册、启动建库/播种
-  database.py        SQLite 连接、表结构
+  database.py        SQLite 连接、表结构、预检只读连接（query_only 事务）
   schemas.py         Pydantic 请求/响应模型
   crud.py            upsert 与写入期校验
+  preflight.py       批量提交预检（只读事务复放，不写库）
   engine.py          溯源链重建（DFS）、校验规则、停用影响模拟（内存 Catalog）
   seed.py            四场景演示数据
   routers/           instruments / certificates / edges /
-                     submissions / trace(report + 停用影响评估) / export / admin
+                     submissions(提交 + 预检) / trace(report + 停用影响评估) /
+                     export / admin
 tests/test_trace.py        10 个接口级测试
 tests/test_deactivation.py 8 个停用影响评估测试
+tests/test_preflight.py    11 个批量提交预检测试
 Dockerfile · docker-compose.yml · requirements.txt
 ```

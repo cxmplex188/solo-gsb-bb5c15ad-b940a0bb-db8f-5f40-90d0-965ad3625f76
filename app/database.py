@@ -96,3 +96,20 @@ def get_db() -> Iterator[sqlite3.Connection]:
 def init_db() -> None:
     with get_conn_ctx() as conn:
         conn.executescript(SCHEMA)
+
+
+def get_readonly_db() -> Iterator[sqlite3.Connection]:
+    """FastAPI 依赖：每请求一个独立只读连接（用于 dry-run 预检）。
+
+    ``PRAGMA query_only=ON`` 后连接在 SQLite 引擎层面拒绝任何写操作，
+    连接关闭时事务回滚，从物理上保证预检不会落库。
+    """
+    conn = _connect()
+    try:
+        conn.execute("PRAGMA query_only = ON")
+        # 显式开启延迟事务，整个预检读到同一快照
+        conn.execute("BEGIN")
+        yield conn
+    finally:
+        conn.rollback()
+        conn.close()
